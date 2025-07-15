@@ -1,4 +1,3 @@
-
 # Advanced user guide
 
 ## Rest API
@@ -61,4 +60,3 @@ detailed_usage/udf/Overview
 detailed_usage/publisher/Overview
 detailed_usage/how-to-advanced/Overview
 ```
-   
