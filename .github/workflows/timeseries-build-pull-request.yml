@@ -33,6 +33,8 @@ permissions:
   contents: read
   packages: read
   pull-requests: read
+  security-events: write
+  actions: read
 
 jobs:
   timeseries-pre-merge-build:
@@ -116,4 +118,6 @@ jobs:
         path: /tmp/report.txt
   
   timeseries-scans:
-    uses: ./.github/workflows/timeseries-scans-virus-bandit-pylint.yaml
+    uses: ./.github/workflows/timeseries-scans.yaml
+    with:
+      target: all-scans
