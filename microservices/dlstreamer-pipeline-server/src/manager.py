@@ -526,8 +526,10 @@ class PipelineServerManager:
             Tuple: A tuple of pipeline instance and its parameter dict
         """
         for p in self._PIPELINES.values():
-            inst_book = p._INSTANCES[instance_id]
-            return inst_book["obj"], inst_book["params"]
+            inst_book = p._INSTANCES.get(instance_id)
+            if inst_book:
+                return inst_book["obj"], inst_book["params"]
+        raise KeyError(instance_id)
 
     def get_loaded_pipelines(self)->List[Dict[str,Any]]:
         """GET /pipelines"""
@@ -558,6 +560,34 @@ class PipelineServerManager:
     def get_instance_status(self, instance_id: str) -> List[Dict]:
         """GET /pipelines/{instance_id}/status"""
         return self.pserv.pipeline_manager.get_instance_status(instance_id)
+
+    def update_element_properties(
+            self,
+            instance_id: str,
+            element_name: str,
+            properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Update schema-declared properties on a running pipeline element."""
+        update_lock = self.pserv.pipeline_manager.get_instance_update_lock(instance_id)
+        with update_lock:
+            result = self.pserv.pipeline_manager.update_element_properties(
+                instance_id, element_name, properties
+            )
+            try:
+                pipeline_instance, instance_parameters = self._get_pinstance_data(instance_id)
+                summary = self.pserv.pipeline_manager.get_instance_summary(instance_id)
+                request = summary.get("request", {})
+                pipeline_instance._request = copy.deepcopy(request)
+                pipeline_instance._parameters = copy.deepcopy(request.get("parameters", {}))
+                instance_parameters["request"] = copy.deepcopy(request)
+                instance_parameters["parameters"] = copy.deepcopy(
+                    request.get("parameters", {})
+                )
+            except KeyError:
+                self.log.warning(
+                    "Updated properties for pipeline instance missing from manager state: %s",
+                    instance_id,
+                )
+            return result
 
     def stop_instance(self, 
                       instance_id: str)->str:

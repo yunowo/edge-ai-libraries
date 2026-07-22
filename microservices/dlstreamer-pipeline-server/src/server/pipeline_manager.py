@@ -8,7 +8,7 @@ import os
 import json
 import string
 import traceback
-from threading import Lock
+from threading import Lock, RLock
 from collections import deque
 from collections import defaultdict
 import uuid
@@ -31,6 +31,7 @@ class PipelineManager:
         self.pipeline_state = {}
         self.pipelines = {}
         self.pipeline_queue = deque()
+        self._instance_update_locks = defaultdict(RLock)
         self.pipeline_dir = pipeline_dir
         self.logger = logging.get_logger('PipelineManager', is_static=True)
         self._run_counter_lock = Lock()
@@ -313,6 +314,8 @@ class PipelineManager:
         return instance_id, None
 
     def _get_next_pipeline_identifier(self):
+        # Caller must hold self._run_counter_lock so that the capacity check,
+        # the queue pop and the running_pipelines increment happen atomically.
         if (self.max_running_pipelines > 0):
             if (self.running_pipelines >= self.max_running_pipelines):
                 return None
@@ -326,12 +329,16 @@ class PipelineManager:
         return None
 
     def _start(self):
-        pipeline_identifier = self._get_next_pipeline_identifier()
-        if (pipeline_identifier):
+        with self._run_counter_lock:
+            pipeline_identifier = self._get_next_pipeline_identifier()
+            if pipeline_identifier is None:
+                return
             pipeline_to_start = self.pipeline_instances[pipeline_identifier]
-            with self._run_counter_lock:
-                self.running_pipelines += 1
-            pipeline_to_start.start()
+            self.running_pipelines += 1
+        # start() is called outside the counter lock: it may block, and on a
+        # synchronous failure it invokes _pipeline_finished, which re-acquires
+        # the same (non-reentrant) lock. Holding it here would deadlock.
+        pipeline_to_start.start()
 
     def _pipeline_finished(self):
         with self._run_counter_lock:
@@ -359,6 +366,85 @@ class PipelineManager:
             status = self.pipeline_instances[instance_id].status()
             return status
         return None
+
+    def get_instance_update_lock(self, instance_id):
+        return self._instance_update_locks[instance_id]
+
+    def update_element_properties(self, instance_id, element_name, properties):
+        if not self.instance_exists(instance_id):
+            raise KeyError("Pipeline instance not found")
+        if not isinstance(properties, dict) or not properties:
+            raise ValueError("Properties must be a non-empty object")
+
+        with self._instance_update_locks[instance_id]:
+            pipeline_instance = self.pipeline_instances[instance_id]
+            parameter_definitions = pipeline_instance.config.get(
+                "parameters", {}
+            ).get("properties", {})
+            property_owners = {}
+            matching_definitions = {}
+
+            for parameter_name, parameter_definition in parameter_definitions.items():
+                if parameter_definition.get("runtime") is not True:
+                    continue
+                element_definitions = parameter_definition.get("element", [])
+                if not isinstance(element_definitions, list):
+                    element_definitions = [element_definitions]
+                if not any(
+                    isinstance(element_definition, dict)
+                    and element_definition.get("name") == element_name
+                    and element_definition.get("format") == "element-properties"
+                    for element_definition in element_definitions
+                ):
+                    continue
+
+                matching_definitions[parameter_name] = parameter_definition
+                for property_name in parameter_definition.get("properties", {}):
+                    if property_name in property_owners:
+                        raise ValueError(
+                            "Runtime element property is declared more than once: {}".format(
+                                property_name
+                            )
+                        )
+                    property_owners[property_name] = parameter_name
+
+            if not matching_definitions or not property_owners:
+                raise ValueError("Pipeline element is not runtime configurable")
+            if any(property_name not in property_owners for property_name in properties):
+                raise ValueError("Invalid runtime element properties")
+
+            request_parameters = pipeline_instance.request.get("parameters", {})
+            request_updates = defaultdict(dict)
+            for property_name, property_value in properties.items():
+                request_updates[property_owners[property_name]][property_name] = property_value
+
+            for parameter_name, parameter_updates in request_updates.items():
+                parameter_schema = copy.deepcopy(matching_definitions[parameter_name])
+                parameter_schema.pop("element", None)
+                parameter_values = copy.deepcopy(
+                    request_parameters.get(parameter_name, {})
+                )
+                parameter_values.update(parameter_updates)
+                validation_errors = sorted(
+                    jsonschema.Draft4Validator(
+                        parameter_schema,
+                        format_checker=jsonschema.draft4_format_checker,
+                    ).iter_errors(parameter_values),
+                    key=lambda error: list(error.path),
+                )
+                if validation_errors:
+                    raise ValueError(
+                        "Invalid runtime element properties"
+                    ) from validation_errors[0]
+
+            effective_properties = pipeline_instance.update_element_properties(
+                element_name, properties, request_updates
+            )
+            return {
+                "id": instance_id,
+                "element": element_name,
+                "properties": effective_properties,
+            }
 
     def stop_instance(self, instance_id, name=None, version=None):
         if self.instance_exists(instance_id, name, version):

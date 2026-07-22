@@ -11,7 +11,8 @@ import os
 from pydantic import ValidationError
 from http import HTTPStatus
 from src.common.log import get_logger
-from src.server.pipeline import Pipeline
+from src.model_updater import ModelRegistryClient, ModelQueryParams
+from src.server.pipeline import ElementPropertyRollbackError, Pipeline, PipelineNotRunningError
 
 logger = get_logger('REST API Endpoints')
 
@@ -193,6 +194,54 @@ class Endpoints:
             return ('Invalid instance', HTTPStatus.BAD_REQUEST)
         except Exception as error:
             logger.error('pipelines_instance_id_status_get %s', error)
+            return ('Unexpected error', HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def pipelines_instance_id_elements_element_name_properties_patch(
+            instance_id, element_name):  # noqa: E501
+        """Update schema-declared properties on a running pipeline element."""
+        logger.debug(
+            "PATCH on /pipelines/%s/elements/%s/properties",
+            instance_id,
+            element_name,
+        )
+        if not connexion.request.is_json:
+            return ('Invalid Request, Body must be valid JSON', HTTPStatus.BAD_REQUEST)
+
+        try:
+            request = connexion.request.get_json()
+            properties = request.get("properties") if isinstance(request, dict) else None
+            result = Endpoints.pipeline_server_manager.update_element_properties(
+                instance_id, element_name, properties
+            )
+            return result
+        except KeyError:
+            return ('Pipeline instance not found', HTTPStatus.NOT_FOUND)
+        except ValueError as error:
+            logger.warning(
+                "Rejected runtime property update for pipeline %s element %s: %s",
+                instance_id,
+                element_name,
+                error,
+            )
+            return (str(error), HTTPStatus.BAD_REQUEST)
+        except PipelineNotRunningError as error:
+            return (str(error), HTTPStatus.CONFLICT)
+        except ElementPropertyRollbackError as error:
+            logger.error(
+                "Runtime property rollback failed for pipeline %s element %s: %s",
+                instance_id,
+                element_name,
+                error,
+            )
+            return (str(error), HTTPStatus.INTERNAL_SERVER_ERROR)
+        except TimeoutError:
+            return ('Timed out updating pipeline element properties',
+                    HTTPStatus.GATEWAY_TIMEOUT)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logger.error(
+                'pipelines_instance_id_elements_element_name_properties_patch %s',
+                error,
+            )
             return ('Unexpected error', HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def pipelines_name_version_post(name, version):  # noqa: E501

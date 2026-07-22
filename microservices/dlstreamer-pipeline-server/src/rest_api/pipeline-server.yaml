@@ -266,6 +266,50 @@ paths:
                 $ref: '#/components/schemas/PipelineInstanceStatus'
           description: Success
       x-openapi-router-controller: src.rest_api.endpoints.Endpoints
+  /pipelines/{instance_id}/elements/{element_name}/properties:
+    patch:
+      description: Update schema-declared properties on a running pipeline element.
+      operationId: pipelines_instance_id_elements_element_name_properties_patch
+      parameters:
+        - explode: false
+          in: path
+          name: instance_id
+          required: true
+          schema:
+            type: string
+          style: simple
+        - explode: false
+          in: path
+          name: element_name
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$'
+          style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ElementPropertiesUpdate'
+        required: true
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ElementPropertiesUpdateResult'
+          description: Properties updated successfully.
+        400:
+          description: Invalid or undeclared element properties.
+        404:
+          description: Pipeline instance not found.
+        409:
+          description: Pipeline instance is not running.
+        500:
+          description: A property update failed and the previous values could not be restored.
+        504:
+          description: Timed out applying the property update.
+      x-openapi-router-controller: src.rest_api.endpoints.Endpoints
   /pipelines/{name}/{version}/{instance_id}/status:
     get:
       description: Return pipeline instance status.
@@ -303,6 +347,31 @@ paths:
 components:
   schemas:
     AnyValue: {}
+    ElementPropertiesUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        properties:
+          type: object
+          minProperties: 1
+          maxProperties: 32
+          additionalProperties: true
+      required:
+        - properties
+    ElementPropertiesUpdateResult:
+      type: object
+      properties:
+        id:
+          type: string
+        element:
+          type: string
+        properties:
+          type: object
+          additionalProperties: true
+      required:
+        - id
+        - element
+        - properties
     Pipeline:
       example:
         description: description
@@ -339,7 +408,11 @@ components:
           type: integer
         state:
           enum:
+            - QUEUED
             - RUNNING
+            - RECONNECTING
+            - BACKOFF_WAIT
+            - STOPPING
             - COMPLETED
             - ERROR
             - ABORTED

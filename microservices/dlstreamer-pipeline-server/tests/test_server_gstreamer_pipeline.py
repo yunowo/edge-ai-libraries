@@ -7,9 +7,10 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from src.server.gstreamer_pipeline import GStreamerPipeline
+from src.server.pipeline import ElementPropertyRollbackError
 import time
 import json
-from gi.repository import Gst, GLib
+from gi.repository import Gst, GLib, GObject
 from collections import deque, namedtuple 
 import os
 
@@ -165,10 +166,162 @@ class TestGStreamerPipeline:
         gstreamer_pipeline.get_avg_fps.assert_called_once()
         assert avg_fps == 0
 
+    def test_update_element_properties(self, gstreamer_pipeline, mocker):
+        gstreamer_pipeline.state = gstreamer_pipeline.state.RUNNING
+        gstreamer_pipeline.pipeline = MagicMock()
+        renderer = MagicMock()
+        writable_spec = MagicMock(
+            name="zoom",
+            flags=GObject.ParamFlags.READABLE | GObject.ParamFlags.WRITABLE,
+        )
+        writable_spec.name = "zoom"
+        renderer.list_properties.return_value = [writable_spec]
+        renderer.get_property.return_value = 2.0
+        gstreamer_pipeline.pipeline.get_by_name.return_value = renderer
+        mocker.patch.object(GLib, "idle_add", side_effect=lambda callback: callback())
+
+        result = gstreamer_pipeline.update_element_properties(
+            "renderer",
+            {"zoom": 2.0},
+            {"render-properties": {"zoom": 2.0}},
+        )
+
+        assert result == {"zoom": 2.0}
+        assert gstreamer_pipeline.request["parameters"]["render-properties"] == {
+            "zoom": 2.0
+        }
+        renderer.set_property.assert_called_once_with("zoom", 2.0)
+
+    def test_update_element_properties_cancels_before_dispatch(
+        self, gstreamer_pipeline, mocker
+    ):
+        callback = None
+
+        def schedule(scheduled_callback):
+            nonlocal callback
+            callback = scheduled_callback
+            return 42
+
+        mocker.patch.object(GLib, "idle_add", side_effect=schedule)
+        source_remove = mocker.patch.object(GLib, "source_remove")
+
+        with pytest.raises(
+            TimeoutError, match="Timed out updating pipeline element properties"
+        ):
+            gstreamer_pipeline.update_element_properties(
+                "renderer", {"zoom": 2.0}, timeout=0.01
+            )
+
+        source_remove.assert_called_once_with(42)
+        assert callback() == GLib.SOURCE_REMOVE
+        gstreamer_pipeline.pipeline = MagicMock()
+        gstreamer_pipeline.pipeline.get_by_name.assert_not_called()
+
+    def test_update_element_properties_rolls_back_on_failure(
+        self, gstreamer_pipeline, mocker
+    ):
+        gstreamer_pipeline.state = gstreamer_pipeline.state.RUNNING
+        gstreamer_pipeline.pipeline = MagicMock()
+        renderer = MagicMock()
+        property_specs = []
+        for property_name in ("zoom", "point-radius"):
+            property_spec = MagicMock(
+                name=property_name,
+                flags=GObject.ParamFlags.READABLE | GObject.ParamFlags.WRITABLE,
+            )
+            property_spec.name = property_name
+            property_specs.append(property_spec)
+        renderer.list_properties.return_value = property_specs
+        property_values = {"zoom": 1.0, "point-radius": 2}
+        renderer.get_property.side_effect = lambda name: property_values[name]
+
+        def set_property(name, value):
+            if name == "point-radius" and value == 0:
+                raise ValueError("invalid")
+            property_values[name] = value
+
+        renderer.set_property.side_effect = set_property
+        gstreamer_pipeline.pipeline.get_by_name.return_value = renderer
+        mocker.patch.object(GLib, "idle_add", side_effect=lambda callback: callback())
+
+        with pytest.raises(ValueError, match="Invalid element property value"):
+            gstreamer_pipeline.update_element_properties(
+                "renderer", {"zoom": 2.0, "point-radius": 0}
+            )
+
+        assert renderer.set_property.call_args_list[-2:] == [
+            mocker.call("zoom", 1.0),
+            mocker.call("point-radius", 2.0),
+        ]
+        assert property_values == {"zoom": 1.0, "point-radius": 2}
+
+    def test_update_element_properties_reports_rollback_failure(
+        self, gstreamer_pipeline, mocker
+    ):
+        gstreamer_pipeline.state = gstreamer_pipeline.state.RUNNING
+        gstreamer_pipeline.pipeline = MagicMock()
+        renderer = MagicMock()
+        property_spec = MagicMock(
+            name="zoom",
+            flags=GObject.ParamFlags.READABLE | GObject.ParamFlags.WRITABLE,
+        )
+        property_spec.name = "zoom"
+        renderer.list_properties.return_value = [property_spec]
+        renderer.get_property.return_value = 1.0
+        renderer.set_property.side_effect = [ValueError("update"), ValueError("rollback")]
+        gstreamer_pipeline.pipeline.get_by_name.return_value = renderer
+        mocker.patch.object(GLib, "idle_add", side_effect=lambda callback: callback())
+
+        with pytest.raises(
+            ElementPropertyRollbackError,
+            match="Failed to restore pipeline element properties",
+        ):
+            gstreamer_pipeline.update_element_properties(
+                "renderer", {"zoom": 2.0}
+            )
+
+    @pytest.mark.parametrize(
+        "property_name, property_flags, expected_error",
+        [
+            ("unknown", None, "Element property not found: unknown"),
+            ("zoom", GObject.ParamFlags.READABLE, "Element property is not writable: zoom"),
+            ("zoom", GObject.ParamFlags.WRITABLE, "Element property is not readable: zoom"),
+            (
+                "zoom",
+                GObject.ParamFlags.READABLE
+                | GObject.ParamFlags.WRITABLE
+                | GObject.ParamFlags.CONSTRUCT_ONLY,
+                "Element property is construct-only: zoom",
+            ),
+        ],
+    )
+    def test_update_element_properties_rejects_invalid_property(
+        self, gstreamer_pipeline, mocker, property_name, property_flags, expected_error
+    ):
+        gstreamer_pipeline.state = gstreamer_pipeline.state.RUNNING
+        gstreamer_pipeline.pipeline = MagicMock()
+        renderer = MagicMock()
+        if property_flags is None:
+            renderer.list_properties.return_value = []
+        else:
+            property_spec = MagicMock(name=property_name, flags=property_flags)
+            property_spec.name = property_name
+            renderer.list_properties.return_value = [property_spec]
+        gstreamer_pipeline.pipeline.get_by_name.return_value = renderer
+        mocker.patch.object(GLib, "idle_add", side_effect=lambda callback: callback())
+
+        with pytest.raises(ValueError, match=expected_error):
+            gstreamer_pipeline.update_element_properties(
+                "renderer", {property_name: 2.0}
+            )
+
+        renderer.set_property.assert_not_called()
+
     def test_stop_running_pipeline(self, mocker, gstreamer_pipeline,Gst):
-        gstreamer_pipeline.state = MagicMock()
-        gstreamer_pipeline.state.name = "RUNNING"
-        gstreamer_pipeline.state.stopped.return_value = False
+        previous_state = MagicMock()
+        previous_state.name = "RUNNING"
+        previous_state.stopped.return_value = False
+        gstreamer_pipeline.state = previous_state
         mock_status = MagicMock()
         mocker.patch.object(gstreamer_pipeline,'status',return_value = mock_status)
         mock_pipeline = MagicMock()
@@ -176,11 +329,39 @@ class TestGStreamerPipeline:
         Gst.Structure.new_empty.return_value = "Structure"
         Gst.Message.new_custom.return_value = "message"
         status = gstreamer_pipeline.stop()
-        assert gstreamer_pipeline.state.stopped.call_count == 1
+        previous_state.stopped.assert_called_once()
+        assert gstreamer_pipeline.state == gstreamer_pipeline.state.STOPPING
         Gst.Structure.new_empty.assert_called_once_with(gstreamer_pipeline.state.name)
         Gst.Message.new_custom.assert_called_once_with(Gst.MessageType.APPLICATION,None,"Structure")
         gstreamer_pipeline.pipeline.get_bus().post.assert_called_once_with("message")
         assert status == mock_status
+
+    def test_stop_cancels_reconnect(self, gstreamer_pipeline, mocker, Gst):
+        gstreamer_pipeline.state = gstreamer_pipeline.state.RECONNECTING
+        gstreamer_pipeline._reconnect_source_id = 42
+        gstreamer_pipeline.pipeline = MagicMock()
+        source_remove = mocker.patch.object(GLib, "source_remove")
+        Gst.Structure.new_empty.return_value = "Structure"
+        Gst.Message.new_custom.return_value = "message"
+
+        gstreamer_pipeline.stop()
+
+        assert gstreamer_pipeline.state == gstreamer_pipeline.state.STOPPING
+        assert gstreamer_pipeline._reconnect_source_id is None
+        source_remove.assert_called_once_with(42)
+
+    def test_scheduled_reconnect_does_not_run_while_stopping(
+        self, gstreamer_pipeline, mocker
+    ):
+        gstreamer_pipeline.state = gstreamer_pipeline.state.STOPPING
+        thread = mocker.patch("src.server.gstreamer_pipeline.Thread")
+
+        result = gstreamer_pipeline._scheduled_reconnection_attempt(
+            5, 1000, 1.2, 60000
+        )
+
+        assert result is False
+        thread.assert_not_called()
 
     def test_stop_pipeline_not_running(self, gstreamer_pipeline,mocker,Gst):
         gstreamer_pipeline.state = MagicMock()

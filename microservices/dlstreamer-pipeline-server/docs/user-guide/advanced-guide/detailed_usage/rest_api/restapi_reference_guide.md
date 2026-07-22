@@ -11,6 +11,7 @@ The RESTful API has a default maximum body size of 10 KB, this can be changed by
 | [`GET` /pipelines/{instance_id}/status](#get-pipelinesinstance_idstatus) | Return status of a pipeline instance. |
 | [`POST` /pipelines/{name}/{version}](#post-pipelinesnameversion) | Start new pipeline instance. |
 | [`GET` /pipelines/{instance_id}](#get-pipelinesinstance_id) | Return pipeline instance summary. |
+| [`PATCH` /pipelines/{instance_id}/elements/{element_name}/properties](#patch-pipelinesinstance_idelementselement_nameproperties) | Update declared properties on a running pipeline element. |
 | [`POST` /pipelines/{name}/{version}/{instance_id}](#post-pipelinesnameversioninstance_id) | Send request to an already queued pipeline. Supported only for source of type "image_ingestor". |
 | [`DELETE` /pipelines/{instance_id}](#delete-pipelinesinstance_id) | Stops a running pipeline or cancels a queued pipeline. |
 | [`POST` /pipelines/{name}/{version}/{instance_id}/models](#post-pipelinesnameversioninstance_idmodels) | Download files from the model registry microservice associated with a specific model and deploy it in pipeline. |
@@ -164,6 +165,70 @@ Accepted values: any
 #### Responses
 
 #####   200 - Success
+
+### `PATCH` /pipelines/{instance_id}/elements/{element_name}/properties
+
+Update readable and writable, non-construct-only properties on a named element while its
+pipeline instance is running. The pipeline definition must expose the element through an
+`element-properties` parameter marked with `"runtime": true` and must declare a JSON schema
+for every property that can be updated. Undeclared elements and properties are rejected.
+
+This endpoint uses the same access-control boundary as the other pipeline lifecycle APIs.
+For deployments reachable by untrusted clients, restrict access to the REST service and
+enable HTTPS with mutual TLS or an equivalent authenticated gateway.
+
+Properties that change negotiated caps, such as output width or height, may require stopping
+and restarting the pipeline instead of using this endpoint.
+
+#### Path parameters
+
+##### instance_id
+
+Name: instance_id(required)
+Type: string
+In: path
+
+##### element_name
+
+Name: element_name(required)
+Type: string
+In: path
+
+#### Request body
+
+```json
+{
+  "properties": {
+    "zoom": 2.0,
+    "point-stride": 8
+  }
+}
+```
+
+#### Responses
+
+- `200` - Properties were updated. The response contains the effective values read back from
+  the element.
+- `400` - The element or property is not declared for runtime updates, or a value fails schema
+  validation.
+- `404` - The pipeline instance does not exist.
+- `409` - The pipeline instance is not running.
+- `500` - A property update failed and the previous values could not be restored. Stop and
+  restart the pipeline before issuing more updates.
+- `504` - The update could not be applied on the GStreamer main context before the timeout.
+
+##### 200 - Success
+
+```json
+{
+  "id": "a6d67224eacc11ec9f360242c0a86003",
+  "element": "renderer",
+  "properties": {
+    "zoom": 2.0,
+    "point-stride": 8
+  }
+}
+```
 
 
 ### `POST` /pipelines/{name}/{version}/{instance_id}
