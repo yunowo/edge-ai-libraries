@@ -9,18 +9,23 @@ import json
 import os
 import string
 import time
-from threading import Lock, Thread
+from threading import Event, Lock, Thread, Timer
 from collections import deque, namedtuple
 
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstApp', '1.0')
 # pylint: disable=wrong-import-position
-from gi.repository import GLib, Gst, GstApp
+from gi.repository import GLib, GObject, Gst, GstApp
 from src.server.app_destination import AppDestination
 from src.server.app_source import AppSource
 from src.server.common.utils import logging
-from src.server.pipeline import Pipeline
+from src.server.pipeline import (
+    ElementPropertyRollbackError,
+    ElementPropertyUpdateError,
+    Pipeline,
+    PipelineNotRunningError,
+)
 from src.server.rtsp.gstreamer_rtsp_destination import GStreamerRtspDestination
 from src.server.rtsp.gstreamer_rtsp_server import GStreamerRtspServer
 from src.server.webrtc.gstreamer_webrtc_destination import GStreamerWebRTCDestination
@@ -46,6 +51,12 @@ class GStreamerPipeline(Pipeline):
                               "GvaInferenceBinRegion",
                               "GvaVideoToTensorBackend"]
     G_PARAM_WRITABLE_FLAG = 2
+
+    # If a pipeline asked to stop has not finished tearing down within this many
+    # seconds (e.g. the bus APPLICATION message was never dispatched because the
+    # main loop stalled), a watchdog forces the teardown so the running slot is
+    # reclaimed instead of leaking and wedging the queue at "pending".
+    STOP_WATCHDOG_TIMEOUT_SEC = 10
 
     SOURCE_ALIAS = "auto_source"
     GST_ELEMENTS_WITH_SOURCE_SETUP = ("GstURISourceBin")
@@ -113,6 +124,9 @@ class GStreamerPipeline(Pipeline):
         self._options = options
         self._connection_retries = 0
         self._current_retry_delay = 1000  # 1000ms initial delay
+        self._reconnect_source_id = None
+        self._teardown_done = False
+        self._stop_watchdog_timer = None
 
 
         if (not GStreamerPipeline._mainloop):
@@ -185,47 +199,98 @@ class GStreamerPipeline(Pipeline):
             self._app_destinations.append(webrtc_app_destination)
 
     def _delete_pipeline(self, new_state):
+        # Idempotent: the bus APPLICATION/EOS/ERROR path and the stop watchdog
+        # can both reach teardown for the same pipeline. Guarding here (callers
+        # always hold _create_delete_lock) ensures the teardown work and the
+        # _finished_callback() slot release happen exactly once.
+        if self._teardown_done:
+            self._logger.debug("Pipeline {id} already torn down; skipping".format(
+                id=self.identifier))
+            return
+        self._teardown_done = True
+        self._cancel_stop_watchdog()
         self.state = new_state
         self.stop_time = time.time()
         self._logger.debug("Setting Pipeline {id}"
                            " State to {next_state}".format(id=self.identifier,
                                                            next_state=new_state.name))
-        if self.pipeline:
-            bus = self.pipeline.get_bus()
-            if self._bus_connection_id:
-                bus.remove_signal_watch()
-                bus.disconnect(self._bus_connection_id)
-                self._bus_connection_id = None
-            self.pipeline.set_state(Gst.State.NULL)
-            del self.pipeline
-            self.pipeline = None
+        # Each teardown step is guarded independently, and _finished_callback()
+        # runs in a finally block. A hang-prone or throwing step (e.g.
+        # set_state(NULL) or a WebRTC destination.finish()) must never prevent
+        # the running-pipeline slot from being released, otherwise the next
+        # queued pipeline stays stuck in QUEUED forever.
+        try:
+            # Disconnect the bus first so late messages are ignored.
+            if self.pipeline and self._bus_connection_id:
+                try:
+                    bus = self.pipeline.get_bus()
+                    bus.remove_signal_watch()
+                    bus.disconnect(self._bus_connection_id)
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    self._logger.error("Error disconnecting bus for pipeline {id}: {err}".format(
+                        id=self.identifier, err=error))
+                finally:
+                    self._bus_connection_id = None
 
-        if self._app_source:
-            self._app_source.finish()
-            del self._app_source
-            self._app_source = None
+            # Finish the application source/destinations BEFORE stopping the
+            # pipeline. A WebRTC frame destination pushes into a blocking appsrc
+            # (block=True), so if its peer stops draining the pipeline's appsink
+            # streaming thread blocks inside push-buffer. set_state(NULL) waits
+            # for that thread to pause, so it must be unblocked first or teardown
+            # deadlocks -- observed in the field as set_state(NULL) hanging
+            # forever and wedging the single running-pipeline slot.
+            if self._app_source:
+                try:
+                    self._app_source.finish()
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    self._logger.error("Error finishing app source for pipeline {id}: {err}".format(
+                        id=self.identifier, err=error))
+                finally:
+                    del self._app_source
+                    self._app_source = None
 
-        for destination in self._app_destinations:
-            destination.finish()
+            for destination in self._app_destinations:
+                try:
+                    destination.finish()
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    self._logger.error("Error finishing destination for pipeline {id}: {err}".format(
+                        id=self.identifier, err=error))
+            self._app_destinations.clear()
 
-        if self.appsrc_element:
-            del self.appsrc_element
-            self.appsrc_element = None
+            # Stop the pipeline. With the gvastreammux shutdown deadlock fixed
+            # this returns promptly, so run it directly (not on an abandoned
+            # thread): abandoning set_state(NULL) leaks the entire pipeline --
+            # models and inference contexts included -- which OOMs the host.
+            if self.pipeline:
+                try:
+                    self.pipeline.set_state(Gst.State.NULL)
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    self._logger.error("Error setting pipeline {id} to NULL: {err}".format(
+                        id=self.identifier, err=error))
+                finally:
+                    self.pipeline = None
 
-        if self.appsink_element:
-            del self.appsink_element
-            self.appsink_element = None
+            if self.appsrc_element:
+                del self.appsrc_element
+                self.appsrc_element = None
 
-        self._app_destinations.clear()
+            if self.appsink_element:
+                del self.appsink_element
+                self.appsink_element = None
 
-        if (new_state == Pipeline.State.ERROR):
-            for key in self._cached_element_keys:
-                for pipeline in GStreamerPipeline._inference_element_cache[key].pipelines:
-                    if (self != pipeline):
-                        pipeline.stop()
-                del GStreamerPipeline._inference_element_cache[key]
-
-        self._finished_callback()
+            if (new_state == Pipeline.State.ERROR):
+                for key in self._cached_element_keys:
+                    try:
+                        for pipeline in GStreamerPipeline._inference_element_cache[key].pipelines:
+                            if (self != pipeline):
+                                pipeline.stop()
+                        del GStreamerPipeline._inference_element_cache[key]
+                    except Exception as error:  # pylint: disable=broad-exception-caught
+                        self._logger.error(
+                            "Error clearing inference cache for pipeline {id}: {err}".format(
+                                id=self.identifier, err=error))
+        finally:
+            self._finished_callback()
 
     def _delete_pipeline_with_lock(self, new_state):
         with(self._create_delete_lock):
@@ -240,15 +305,54 @@ class GStreamerPipeline(Pipeline):
 
     def stop(self):
         with(self._create_delete_lock):
+            if self.state == Pipeline.State.STOPPING:
+                return self.status()
             if not self.state.stopped():
+                previous_state = self.state
+                self.state = Pipeline.State.STOPPING
+                if self._reconnect_source_id is not None:
+                    GLib.source_remove(self._reconnect_source_id)
+                    self._reconnect_source_id = None
                 if (self.pipeline):
                     structure = Gst.Structure.new_empty(self.state.name)
                     message = Gst.Message.new_custom(
                         Gst.MessageType.APPLICATION, None, structure)
                     self.pipeline.get_bus().post(message)
+                    # Teardown is async (handled when the bus message is
+                    # dispatched); arm a watchdog to force it if that never
+                    # happens.
+                    self._schedule_stop_watchdog()
                 else:
-                    self.state = Pipeline.State.ABORTED
+                    if previous_state == Pipeline.State.QUEUED:
+                        self.state = Pipeline.State.ABORTED
+                    else:
+                        self._delete_pipeline(Pipeline.State.ABORTED)
         return self.status()
+
+    def _schedule_stop_watchdog(self):
+        if self._stop_watchdog_timer is not None:
+            return
+        watchdog = Timer(self.STOP_WATCHDOG_TIMEOUT_SEC, self._stop_watchdog)
+        watchdog.daemon = True
+        self._stop_watchdog_timer = watchdog
+        watchdog.start()
+
+    def _cancel_stop_watchdog(self):
+        if self._stop_watchdog_timer is not None:
+            self._stop_watchdog_timer.cancel()
+            self._stop_watchdog_timer = None
+
+    def _stop_watchdog(self):
+        """Force teardown if a stop request never completed. Runs on a timer
+        thread; _delete_pipeline is idempotent so racing the normal bus-driven
+        teardown is safe."""
+        with(self._create_delete_lock):
+            if self.state == Pipeline.State.STOPPING and not self._teardown_done:
+                self._logger.warning(
+                    "Pipeline {id} did not finish stopping within {secs}s;"
+                    " forcing teardown".format(
+                        id=self.identifier, secs=self.STOP_WATCHDOG_TIMEOUT_SEC))
+                self._delete_pipeline(Pipeline.State.ABORTED)
 
     def params(self):
         request = copy.deepcopy(self.request)
@@ -303,6 +407,125 @@ class GStreamerPipeline(Pipeline):
 
     def get_avg_fps(self):
         return self._avg_fps
+
+    def update_element_properties(
+            self, element_name, properties, request_updates=None, timeout=5):
+        completed = Event()
+        result = {}
+        error = []
+        callback_lock = Lock()
+        callback_state = {"cancelled": False, "started": False}
+        deadline = time.monotonic() + timeout
+
+        def apply_properties():
+            if not self._create_delete_lock.acquire(blocking=False):
+                return GLib.SOURCE_CONTINUE
+            with callback_lock:
+                if callback_state["cancelled"] or time.monotonic() >= deadline:
+                    completed.set()
+                    self._create_delete_lock.release()
+                    return GLib.SOURCE_REMOVE
+                callback_state["started"] = True
+
+            try:
+                original_properties = {}
+                try:
+                    if self.state != Pipeline.State.RUNNING or not self.pipeline:
+                        raise PipelineNotRunningError("Pipeline instance is not running")
+
+                    element = self.pipeline.get_by_name(element_name)
+                    if not element:
+                        raise ElementPropertyUpdateError("Pipeline element not found")
+
+                    property_specs = {spec.name: spec for spec in element.list_properties()}
+                    for property_name in properties:
+                        spec = property_specs.get(property_name)
+                        if not spec:
+                            raise ElementPropertyUpdateError(
+                                "Element property not found: {}".format(property_name)
+                            )
+                        if not spec.flags & GObject.ParamFlags.READABLE:
+                            raise ElementPropertyUpdateError(
+                                "Element property is not readable: {}".format(property_name)
+                            )
+                        if not spec.flags & GObject.ParamFlags.WRITABLE:
+                            raise ElementPropertyUpdateError(
+                                "Element property is not writable: {}".format(property_name)
+                            )
+                        if spec.flags & GObject.ParamFlags.CONSTRUCT_ONLY:
+                            raise ElementPropertyUpdateError(
+                                "Element property is construct-only: {}".format(property_name)
+                            )
+
+                    original_properties = {
+                        property_name: element.get_property(property_name)
+                        for property_name in properties
+                    }
+                    for property_name, property_value in properties.items():
+                        element.set_property(property_name, property_value)
+                        effective_value = element.get_property(property_name)
+                        if not isinstance(effective_value, (bool, int, float, str, type(None))):
+                            if hasattr(effective_value, "value_nick"):
+                                effective_value = effective_value.value_nick
+                            else:
+                                raise ElementPropertyUpdateError(
+                                    "Element property value cannot be returned as JSON: {}".format(
+                                        property_name
+                                    )
+                                )
+                        result[property_name] = effective_value
+
+                    for parameter_name, parameter_properties in (request_updates or {}).items():
+                        parameter_values = self.request.setdefault(
+                            "parameters", {}
+                        ).setdefault(parameter_name, {})
+                        parameter_values.update(parameter_properties)
+                except Exception as update_error:  # pylint: disable=broad-exception-caught
+                    rollback_errors = []
+                    for property_name, property_value in original_properties.items():
+                        try:
+                            element.set_property(property_name, property_value)
+                        except Exception as rollback_error:  # pylint: disable=broad-exception-caught
+                            rollback_errors.append((property_name, rollback_error))
+                    result.clear()
+                    if rollback_errors:
+                        self._logger.error(
+                            "Failed to restore element properties: %s",
+                            ", ".join(name for name, _ in rollback_errors),
+                        )
+                        error.append(ElementPropertyRollbackError(
+                            "Failed to restore pipeline element properties"
+                        ))
+                        try:
+                            self._delete_pipeline(Pipeline.State.ERROR)
+                        except Exception as cleanup_error:  # pylint: disable=broad-exception-caught
+                            self._logger.error(
+                                "Failed to stop inconsistent pipeline: %s",
+                                cleanup_error,
+                            )
+                    else:
+                        error.append(update_error)
+                finally:
+                    completed.set()
+            finally:
+                self._create_delete_lock.release()
+            return GLib.SOURCE_REMOVE
+
+        source_id = GLib.idle_add(apply_properties)
+        if not completed.wait(timeout):
+            with callback_lock:
+                if not callback_state["started"]:
+                    callback_state["cancelled"] = True
+                    GLib.source_remove(source_id)
+                    raise TimeoutError("Timed out updating pipeline element properties")
+            completed.wait()
+        if error:
+            if isinstance(error[0], (PipelineNotRunningError,
+                                     ElementPropertyUpdateError,
+                                     ElementPropertyRollbackError)):
+                raise error[0]
+            raise ElementPropertyUpdateError("Invalid element property value") from error[0]
+        return result
 
     def _get_element_property(self, element, key):
         if isinstance(element, str):
@@ -831,6 +1054,8 @@ class GStreamerPipeline(Pipeline):
         # disconnects it.
         if self.state in (Pipeline.State.ABORTED, Pipeline.State.COMPLETED, Pipeline.State.ERROR):
             return True
+        if self.state == Pipeline.State.STOPPING and message_type != Gst.MessageType.APPLICATION:
+            return True
         if message_type == Gst.MessageType.APPLICATION:
             self._logger.info("Pipeline {id} Aborted".format(id=self.identifier))
             self.state = Pipeline.State.ABORTED
@@ -900,15 +1125,28 @@ class GStreamerPipeline(Pipeline):
         )
 
 
-        self.state = Pipeline.State.RECONNECTING
-
-        GLib.timeout_add(self._current_retry_delay, self._scheduled_reconnection_attempt, max_retries, 1000, 1.2, 60000)
+        with self._create_delete_lock:
+            if self.state == Pipeline.State.STOPPING or self.state.stopped():
+                return False
+            self.state = Pipeline.State.RECONNECTING
+            self._reconnect_source_id = GLib.timeout_add(
+                self._current_retry_delay,
+                self._scheduled_reconnection_attempt,
+                max_retries,
+                1000,
+                1.2,
+                60000,
+            )
 
         return True  # Recovery attempted, will be handled asynchronously
 
     def _scheduled_reconnection_attempt(self, max_retries, initial_delay_ms, backoff_multiplier, max_delay_ms):
         """Scheduled reconnection callback - spawns a background thread
         to avoid blocking the GLib MainLoop with set_state(NULL)."""
+        with self._create_delete_lock:
+            self._reconnect_source_id = None
+            if self.state == Pipeline.State.STOPPING or self.state.stopped():
+                return False
         thread = Thread(target=self._do_reconnection,
                         args=(max_retries, initial_delay_ms, backoff_multiplier, max_delay_ms))
         thread.daemon = True
@@ -923,9 +1161,10 @@ class GStreamerPipeline(Pipeline):
                 f"({self._connection_retries}/{max_retries})..."
             )
 
-            self.state = Pipeline.State.BACKOFF_WAIT
-
             with self._create_delete_lock:
+                if self.state == Pipeline.State.STOPPING or self.state.stopped():
+                    return
+                self.state = Pipeline.State.BACKOFF_WAIT
                 # Destroy current pipeline
                 if self.pipeline:
                     bus = self.pipeline.get_bus()
@@ -994,7 +1233,14 @@ class GStreamerPipeline(Pipeline):
         except Exception as e:
             self._logger.error(f"Pipeline {self.identifier}: Reconnection attempt failed - {e}")
 
-            if self._connection_retries < max_retries:
+            with self._create_delete_lock:
+                should_retry = (
+                    self.state != Pipeline.State.STOPPING
+                    and not self.state.stopped()
+                    and self._connection_retries < max_retries
+                )
+
+            if should_retry:
                 # Calculate next delay with exponential backoff
                 current_delay = min(
                     int(self._current_retry_delay * backoff_multiplier),
@@ -1005,8 +1251,20 @@ class GStreamerPipeline(Pipeline):
                     f"Pipeline {self.identifier}: Scheduling next retry in {current_delay}ms"
                 )
                 # Reschedule for next attempt via MainLoop (thread-safe)
-                GLib.timeout_add(current_delay, self._scheduled_reconnection_attempt, max_retries, initial_delay_ms, backoff_multiplier, max_delay_ms)
+                with self._create_delete_lock:
+                    if self.state == Pipeline.State.STOPPING or self.state.stopped():
+                        return
+                    self._reconnect_source_id = GLib.timeout_add(
+                        current_delay,
+                        self._scheduled_reconnection_attempt,
+                        max_retries,
+                        initial_delay_ms,
+                        backoff_multiplier,
+                        max_delay_ms,
+                    )
             else:
+                if self.state == Pipeline.State.STOPPING or self.state.stopped():
+                    return
                 # All retries exhausted
                 self._logger.error(
                     f"Pipeline {self.identifier}: All reconnection attempts exhausted ({max_retries})"

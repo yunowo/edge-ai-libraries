@@ -133,6 +133,131 @@ class TestPipelineManager:
         status = pipeline_manager.get_all_instance_status()
         assert status == [{'pipeline1': 'running'},{'pipeline2': 'running'}]
 
+    def test_update_element_properties(self, pipeline_manager):
+        pipeline_instance = MagicMock()
+        pipeline_instance.config = {
+            "parameters": {
+                "properties": {
+                    "render-properties": {
+                        "type": "object",
+                        "runtime": True,
+                        "properties": {
+                            "zoom": {
+                                "type": "number",
+                                "minimum": 0.1,
+                                "maximum": 20.0,
+                            }
+                        },
+                        "element": {
+                            "name": "renderer",
+                            "format": "element-properties",
+                        },
+                    }
+                }
+            }
+        }
+        pipeline_instance.request = {"parameters": {}}
+
+        def update_element_properties(element_name, properties, request_updates):
+            for parameter_name, parameter_properties in request_updates.items():
+                pipeline_instance.request["parameters"].setdefault(
+                    parameter_name, {}
+                ).update(parameter_properties)
+            return {"zoom": 2.0}
+
+        pipeline_instance.update_element_properties.side_effect = update_element_properties
+        pipeline_manager.pipeline_instances = {"instance_id": pipeline_instance}
+
+        result = pipeline_manager.update_element_properties(
+            "instance_id", "renderer", {"zoom": 2.0}
+        )
+
+        assert result == {
+            "id": "instance_id",
+            "element": "renderer",
+            "properties": {"zoom": 2.0},
+        }
+        assert pipeline_instance.request["parameters"]["render-properties"] == {
+            "zoom": 2.0
+        }
+        pipeline_instance.update_element_properties.assert_called_once_with(
+            "renderer",
+            {"zoom": 2.0},
+            {"render-properties": {"zoom": 2.0}},
+        )
+
+    def test_update_element_properties_rejects_ambiguous_declaration(
+        self, pipeline_manager
+    ):
+        pipeline_instance = MagicMock()
+        property_definition = {
+            "type": "object",
+            "runtime": True,
+            "properties": {"zoom": {"type": "number"}},
+            "element": {"name": "renderer", "format": "element-properties"},
+        }
+        pipeline_instance.config = {
+            "parameters": {
+                "properties": {
+                    "first-render-properties": property_definition,
+                    "second-render-properties": property_definition,
+                }
+            }
+        }
+        pipeline_manager.pipeline_instances = {"instance_id": pipeline_instance}
+
+        with pytest.raises(
+            ValueError, match="Runtime element property is declared more than once: zoom"
+        ):
+            pipeline_manager.update_element_properties(
+                "instance_id", "renderer", {"zoom": 2.0}
+            )
+
+        pipeline_instance.update_element_properties.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "element_name, properties",
+        [
+            ("source", {"zoom": 2.0}),
+            ("renderer", {"unknown": 2.0}),
+            ("renderer", {"zoom": 21.0}),
+            ("renderer", {}),
+        ],
+    )
+    def test_update_element_properties_rejects_undeclared_or_invalid_values(
+        self, pipeline_manager, element_name, properties
+    ):
+        pipeline_instance = MagicMock()
+        pipeline_instance.config = {
+            "parameters": {
+                "properties": {
+                    "render-properties": {
+                        "type": "object",
+                        "runtime": True,
+                        "properties": {
+                            "zoom": {
+                                "type": "number",
+                                "minimum": 0.1,
+                                "maximum": 20.0,
+                            }
+                        },
+                        "element": {
+                            "name": "renderer",
+                            "format": "element-properties",
+                        },
+                    }
+                }
+            }
+        }
+        pipeline_manager.pipeline_instances = {"instance_id": pipeline_instance}
+
+        with pytest.raises(ValueError):
+            pipeline_manager.update_element_properties(
+                "instance_id", element_name, properties
+            )
+
+        pipeline_instance.update_element_properties.assert_not_called()
+
     @pytest.mark.parametrize(
     "instance_exists_value, pipeline_instances, instance_id, expected_params",
     [

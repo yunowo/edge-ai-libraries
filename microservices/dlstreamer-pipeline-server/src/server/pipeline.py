@@ -6,6 +6,18 @@
 
 from enum import Enum, auto
 
+
+class PipelineNotRunningError(RuntimeError):
+    pass
+
+
+class ElementPropertyUpdateError(ValueError):
+    pass
+
+
+class ElementPropertyRollbackError(RuntimeError):
+    pass
+
 class Pipeline:
     class State(Enum):
         QUEUED = auto()
@@ -13,11 +25,16 @@ class Pipeline:
         COMPLETED = auto()
         RECONNECTING = auto()
         BACKOFF_WAIT = auto()
+        STOPPING = auto()
         ERROR = auto()
         ABORTED = auto()
 
         def stopped(self):
-            return not (self is Pipeline.State.QUEUED or self is Pipeline.State.RUNNING)
+            return self in (
+                Pipeline.State.COMPLETED,
+                Pipeline.State.ERROR,
+                Pipeline.State.ABORTED,
+            )
 
     def __init__(self, identifier, config, model_manager, request, finished_callback, options):
         pass

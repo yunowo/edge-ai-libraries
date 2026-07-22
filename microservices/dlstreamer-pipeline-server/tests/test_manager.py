@@ -449,6 +449,45 @@ class TestPipelineServerManager:
         assert error == "Failed to execute request"
         pipeline_server_manager.log.exception.assert_called_once_with("Failed to execute request.instance_123 Execution error")
 
+    def test_update_element_properties(self, pipeline_server_manager):
+        pipeline_server_manager.pserv = MagicMock()
+        expected = {
+            "id": "instance_123",
+            "element": "renderer",
+            "properties": {"zoom": 2.0},
+        }
+        pipeline_server_manager.pserv.pipeline_manager.update_element_properties.return_value = expected
+
+        result = pipeline_server_manager.update_element_properties(
+            "instance_123", "renderer", {"zoom": 2.0}
+        )
+
+        assert result == expected
+        pipeline_server_manager.pserv.pipeline_manager.update_element_properties.assert_called_once_with(
+            "instance_123", "renderer", {"zoom": 2.0}
+        )
+
+    def test_get_pinstance_data_checks_all_pipelines(self, pipeline_server_manager):
+        expected_instance = MagicMock()
+        expected_parameters = {"request": {}}
+        first_pipeline = MagicMock()
+        first_pipeline._INSTANCES = {}
+        second_pipeline = MagicMock()
+        second_pipeline._INSTANCES = {
+            "instance_123": {
+                "obj": expected_instance,
+                "params": expected_parameters,
+            }
+        }
+        pipeline_server_manager._PIPELINES = {
+            "first": first_pipeline,
+            "second": second_pipeline,
+        }
+
+        result = pipeline_server_manager._get_pinstance_data("instance_123")
+
+        assert result == (expected_instance, expected_parameters)
+
     def test_stop_pipelines(self, mocker, pipeline_server_manager):
         pipeline_instance = MagicMock(is_running=True)
         pipeline_server_manager._PIPELINES = {

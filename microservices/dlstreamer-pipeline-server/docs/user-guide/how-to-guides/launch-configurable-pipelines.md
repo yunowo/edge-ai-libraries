@@ -39,6 +39,40 @@ To learn more on setting frame destination, refer to this [section](../advanced-
 
 `parameters` are an optional section (JSON object) within a pipeline definition and are used to specify which pipeline properties are configurable. In the sample pipeline above, we allow parameterization of `gvadetect` element properties (aliased by setting name=detection). To learn more about pipeline parameters, refer to this [section](../advanced-guide/detailed_usage/rest_api/defining_pipelines.md#pipeline-parameters)
 
+To allow selected properties to be updated while a pipeline is running, declare their schemas
+inside an `element-properties` parameter. For example:
+
+```json
+"render-properties": {
+    "type": "object",
+    "runtime": true,
+    "additionalProperties": false,
+    "properties": {
+        "zoom": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 20.0
+        },
+        "point-stride": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+        }
+    },
+    "element": {
+        "name": "renderer",
+        "format": "element-properties"
+    }
+}
+```
+
+Only parameter groups marked with `"runtime": true` can be changed through the runtime
+element-property API. Within those groups, only properties listed in `properties` are
+accepted. The target GStreamer property must also be readable, writable, and not
+construct-only. See the
+[REST endpoints reference](../advanced-guide/detailed_usage/rest_api/restapi_reference_guide.md#patch-pipelinesinstance_idelementselement_nameproperties)
+for the request format.
+
 > **Note:** Refer to this [tutorial](./change-dlstreamer-pipeline.md) and this [section](../advanced-guide/detailed_usage/configuration/dlstreamer-ps-config.md) for configuration file.
 > Refer to [this](../advanced-guide/detailed_usage/rest_api/customizing_pipeline_requests.md) page for detailed instructions on how to define configurable pipelines and launch them using REST command.
 

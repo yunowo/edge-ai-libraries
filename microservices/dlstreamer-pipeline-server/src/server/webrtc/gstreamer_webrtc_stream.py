@@ -21,6 +21,11 @@ import src.server.gstreamer_pipeline as GstPipeline
 from src.server.common.utils import logging
 
 class GStreamerWebRTCStream:
+    # Upper bound on how long stop() waits for the stream thread to exit.
+    # Prevents a stalled WHIP/network handshake from blocking pipeline teardown
+    # (and therefore the release of the running-pipeline slot) indefinitely.
+    _STOP_JOIN_TIMEOUT_SEC = 5
+
     def __init__(self, peer_id, frame_caps, launch_string, destination_instance,
                  whip_endpoint):
         self._logger = logging.get_logger('GStreamerWebRTCStream', is_static=True)
@@ -98,6 +103,11 @@ class GStreamerWebRTCStream:
         self._stopped = True
         self._logger.info("Stopping GStreamer WebRTC Stream for peer_id {}".format(self._peer_id))
         if self._thread:
-            self._thread.join()
+            self._thread.join(self._STOP_JOIN_TIMEOUT_SEC)
+            if self._thread.is_alive():
+                self._logger.warning(
+                    "GStreamer WebRTC Stream thread for peer_id {} did not exit within {}s; "
+                    "abandoning join to avoid blocking pipeline teardown".format(
+                        self._peer_id, self._STOP_JOIN_TIMEOUT_SEC))
         self._thread = None
         self._logger.debug("GStreamer WebRTC Stream completed pipeline for peer_id {}".format(self._peer_id))
