@@ -73,9 +73,17 @@ class GStreamerWebRTCDestination(AppDestination):
         # with wall-clock arrival time, which reintroduces the jitter.
         self._app_src.set_property("do-timestamp", False)
         self._app_src.set_property("blocksize", self._frame_size)
-        if self._sync_with_destination:
-            self._app_src.set_property("block", True)
-            self._app_src.set_property("min-percent", 100)
+        # Decouple the WebRTC consumer from the source pipeline. push-buffer
+        # runs on the fusion appsink streaming thread; if the WHIP peer stalls
+        # and this appsrc blocks, that backpressure propagates up through the
+        # mux into the shared inference stage and drags the whole pipeline to
+        # ~1fps (observed in the field). A live preview favors freshness over
+        # completeness, so never block the source: leak the oldest frames
+        # downstream when the queue is full. The need-data/enough-data gating
+        # in _process_frame still throttles pushes; leaky-type is the safety
+        # net that guarantees push-buffer cannot block.
+        self._app_src.set_property("block", False)
+        self._app_src.set_property("leaky-type", 2)  # GST_APP_LEAKY_TYPE_DOWNSTREAM
         if self._cache_length:
             self._app_src.set_property("max-bytes",
                                        int(self._frame_size*self._cache_length))

@@ -15,15 +15,20 @@ from src.server.common.utils import logging
 class GStreamerWebRTCManager:
 
     _source_mediamtx = "appsrc name=webrtc_source format=GST_FORMAT_TIME "
+    # gop-size forces a keyframe every N frames (~1s at 10fps). Without regular
+    # IDR frames, a WHIP subscriber that (re)connects or drops a packet waits
+    # indefinitely for a keyframe ("Ignoring frame while waiting for a
+    # keyframe"), stops draining, and the resulting backpressure propagates all
+    # the way up to the shared inference stage and stalls the source pipeline.
     _WebRTCVideoPipeline = (
         " ! videoconvert {gvawatermark} "
-        " ! openh264enc complexity=low name=h264enc"
+        " ! openh264enc complexity=low name=h264enc gop-size=10"
         " ! video/x-h264,profile=baseline "
         " ! whipclientsink signaller::whip-endpoint="
     )
     _WebRTCVideoPipeline_jpeg = (
         " ! jpegdec ! videoconvert {gvawatermark} "
-        " ! openh264enc complexity=low name=h264enc "
+        " ! openh264enc complexity=low name=h264enc gop-size=10"
         " ! video/x-h264,profile=baseline "
         " ! whipclientsink signaller::whip-endpoint="
     )
