@@ -22,6 +22,7 @@ class GStreamerWebRTCDestination(AppDestination):
         self._logger = logging.get_logger('GStreamerWebRTCDestination', is_static=True)
         self._need_data = False
         self._pts = 0
+        self._first_src_pts = None
         self._last_timestamp = 0
         self._frame_size = 0
         self._frame_count = 0
@@ -65,8 +66,12 @@ class GStreamerWebRTCDestination(AppDestination):
     def set_app_src(self, app_src, webrtc_pipeline):
         self._app_src = app_src
         self._pts = 0
+        self._first_src_pts = None
         self._app_src.set_property("is-live", True)
-        self._app_src.set_property("do-timestamp", True)
+        # do-timestamp must be off so appsrc honors the per-buffer PTS we set in
+        # _push_buffer (the smooth source cadence) instead of overwriting them
+        # with wall-clock arrival time, which reintroduces the jitter.
+        self._app_src.set_property("do-timestamp", False)
         self._app_src.set_property("blocksize", self._frame_size)
         if self._sync_with_destination:
             self._app_src.set_property("block", True)
@@ -84,12 +89,34 @@ class GStreamerWebRTCDestination(AppDestination):
         self._app_src.connect('enough-data', self._on_enough_data)
 
     def _push_buffer(self, buffer):
-        buffer.make_writable()
         timestamp = self._clock.get_time()
-        delta = timestamp - self._last_timestamp
-        buffer.pts = buffer.dts = self._pts
-        buffer.duration = delta
-        self._pts += delta
+        if buffer.pts != Gst.CLOCK_TIME_NONE:
+            # Preserve the source pacing. The fusion pipeline already emits
+            # constant-rate PTS (e.g. 10 fps -> 0, 100ms, 200ms ...). The
+            # previous code discarded that and rebuilt PTS/duration from
+            # wall-clock arrival gaps, which track the variable per-frame
+            # processing latency of detection/fusion/render -- so the stream
+            # jittered even when the average fps was on target. Pushing the
+            # buffer with its original timestamps carries the smooth cadence
+            # through to the encoder/WHIP (appsrc do-timestamp is off so it
+            # honors these). Rebase to the first frame so the stream starts at
+            # 0 regardless of any source-side offset.
+            if self._first_src_pts is None:
+                self._first_src_pts = buffer.pts
+            out_pts = buffer.pts - self._first_src_pts if buffer.pts >= self._first_src_pts else 0
+            # NB: in the GStreamer Python bindings Gst.Buffer.make_writable()
+            # returns a bool, not the buffer -- call it as a statement and keep
+            # using the same object (do NOT reassign).
+            buffer.make_writable()
+            buffer.pts = buffer.dts = out_pts
+        else:
+            # No usable source PTS: fall back to arrival-time pacing so the
+            # stream still flows.
+            delta = timestamp - self._last_timestamp
+            buffer.make_writable()
+            buffer.pts = buffer.dts = self._pts
+            buffer.duration = delta
+            self._pts += delta
         self._last_timestamp = timestamp
         retval = self._app_src.emit('push-buffer', buffer)
         if retval != Gst.FlowReturn.OK:
