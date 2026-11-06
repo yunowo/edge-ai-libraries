@@ -82,18 +82,43 @@ class TestGStreamerWebRTCDestination:
         gstreamer_webrtc_destination.set_app_src(mock_app_src, mock_webrtc_pipeline)
         assert gstreamer_webrtc_destination._app_src == mock_app_src
         assert gstreamer_webrtc_destination._pts == 0
+        assert gstreamer_webrtc_destination._first_src_pts is None
         mock_app_src.set_property.assert_any_call("is-live", True)
-        mock_app_src.set_property.assert_any_call("do-timestamp", True)
+        # appsrc keeps the PTS set in _push_buffer, and never blocks the source pipeline.
+        mock_app_src.set_property.assert_any_call("do-timestamp", False)
         mock_app_src.set_property.assert_any_call("blocksize", 1000)
-        mock_app_src.set_property.assert_any_call("block", True)
-        mock_app_src.set_property.assert_any_call("min-percent", 100)
+        mock_app_src.set_property.assert_any_call("block", False)
+        mock_app_src.set_property.assert_any_call("leaky-type", 2)
         mock_app_src.set_property.assert_any_call("max-bytes", 30000)
         mock_app_src.connect.assert_any_call('need-data', gstreamer_webrtc_destination._on_need_data)
         mock_app_src.connect.assert_any_call('enough-data', gstreamer_webrtc_destination._on_enough_data)
         mock_webrtc_pipeline.get_by_name.assert_called_once_with("h264enc")
 
-    def test_push_buffer(self, gstreamer_webrtc_destination, mock_pipeline,Gst,mocker):
+    def test_push_buffer_keeps_source_cadence(self, gstreamer_webrtc_destination, mock_pipeline, Gst, mocker):
+        mock_clock = MagicMock()
+        gstreamer_webrtc_destination._clock = mock_clock
+        mock_clock.get_time.return_value = 2000
+        mock_appsrc = MagicMock()
+        gstreamer_webrtc_destination._app_src = mock_appsrc
+        gstreamer_webrtc_destination._first_src_pts = None
+        mock_end_stream = mocker.patch.object(gstreamer_webrtc_destination, '_end_stream')
+        pushed = []
+        for pts in (1000, 1100, 1200):
+            mock_buffer = MagicMock()
+            mock_buffer.pts = pts
+            gstreamer_webrtc_destination._push_buffer(mock_buffer)
+            pushed.append(mock_buffer)
+        # Rebased to the first frame, spaced exactly as the source emitted them.
+        assert [b.pts for b in pushed] == [0, 100, 200]
+        assert [b.dts for b in pushed] == [0, 100, 200]
+        assert gstreamer_webrtc_destination._first_src_pts == 1000
+        assert gstreamer_webrtc_destination._last_timestamp == 2000
+        mock_appsrc.emit.assert_any_call('push-buffer', pushed[-1])
+        assert mock_end_stream.call_count == 3
+
+    def test_push_buffer_without_pts_uses_arrival_time(self, gstreamer_webrtc_destination, mock_pipeline, Gst, mocker):
         mock_buffer = MagicMock()
+        mock_buffer.pts = Gst.CLOCK_TIME_NONE
         mock_clock = MagicMock()
         gstreamer_webrtc_destination._clock = mock_clock
         mock_clock.get_time.return_value = 2000
@@ -101,7 +126,7 @@ class TestGStreamerWebRTCDestination:
         gstreamer_webrtc_destination._pts = 5
         mock_appsrc = MagicMock()
         gstreamer_webrtc_destination._app_src = mock_appsrc
-        mock_end_stream = mocker.patch.object(gstreamer_webrtc_destination,'_end_stream')
+        mock_end_stream = mocker.patch.object(gstreamer_webrtc_destination, '_end_stream')
         gstreamer_webrtc_destination._push_buffer(mock_buffer)
         assert mock_buffer.pts == 5
         assert mock_buffer.dts == 5

@@ -11,7 +11,6 @@ import os
 from pydantic import ValidationError
 from http import HTTPStatus
 from src.common.log import get_logger
-from src.model_updater import ModelRegistryClient, ModelQueryParams
 from src.server.pipeline import ElementPropertyRollbackError, Pipeline, PipelineNotRunningError
 
 logger = get_logger('REST API Endpoints')

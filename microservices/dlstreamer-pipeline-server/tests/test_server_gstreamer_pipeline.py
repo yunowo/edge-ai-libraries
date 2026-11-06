@@ -366,15 +366,18 @@ class TestGStreamerPipeline:
     def test_stop_pipeline_not_running(self, gstreamer_pipeline,mocker,Gst):
         gstreamer_pipeline.state = MagicMock()
         gstreamer_pipeline.state.stopped.return_value = False
+        gstreamer_pipeline.pipeline = None
         mock_state = mocker.patch("src.server.gstreamer_pipeline.Pipeline",return_value = MagicMock())
         mock_status = MagicMock()
         mock_state.State.ABORTED = "ABORT"
+        mock_delete = mocker.patch.object(gstreamer_pipeline, '_delete_pipeline')
         mocker.patch.object(gstreamer_pipeline,'status',return_value = mock_status)
         status = gstreamer_pipeline.stop()
         assert status == mock_status
-        assert gstreamer_pipeline.state == "ABORT"
-        Gst.Structure.new_empty.call_count == 0
-        Gst.Message.new_custom.call_count == 0
+        # A pipeline that never got a GStreamer pipeline is torn down as ABORTED.
+        mock_delete.assert_called_once_with("ABORT")
+        Gst.Structure.new_empty.assert_not_called()
+        Gst.Message.new_custom.assert_not_called()
 
     def test_stop_pipeline_not_running_stop(self, gstreamer_pipeline,mocker,Gst):
         gstreamer_pipeline.state = MagicMock()

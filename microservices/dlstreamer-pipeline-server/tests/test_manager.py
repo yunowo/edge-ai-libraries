@@ -301,11 +301,11 @@ class TestPipelineServerManager:
         pipeline_server_manager.pserv.pipeline_manager.get_instance_summary.return_value = psummary
         pipeline_server_manager.get_pipeline_instance_summary(instance_id)
 
-    def test_get_pipeline_instance_summary_key_error(self, pipeline_server_manager):
+    def test_get_pipeline_instance_summary_key_error(self, pipeline_server_manager, mocker):
         mock_psummary = {"id": "instance_123", "name": "test_pipeline"}
         pipeline_server_manager.pserv = MagicMock()
         pipeline_server_manager.pserv.pipeline_manager.get_instance_summary = MagicMock(return_value=mock_psummary)
-        pipeline_server_manager._get_pinstance_data = MagicMock(side_effect=KeyError)
+        mocker.patch.object(pipeline_server_manager, "_get_pinstance_data", side_effect=KeyError)
         pipeline_server_manager.log = MagicMock()
         result, error = pipeline_server_manager.get_pipeline_instance_summary("instance_123")
         assert result is None
@@ -439,9 +439,9 @@ class TestPipelineServerManager:
         assert err is None
         mock_pipeline.start.assert_called_once()
         
-    def test_execute_request_on_instance_exception(self, pipeline_server_manager):
+    def test_execute_request_on_instance_exception(self, pipeline_server_manager, mocker):
         mock_pinstance = MagicMock()
-        pipeline_server_manager._get_pinstance_data = MagicMock(return_value=(mock_pinstance, None))
+        mocker.patch.object(pipeline_server_manager, "_get_pinstance_data", return_value=(mock_pinstance, None))
         mock_pinstance.execute_request = MagicMock(side_effect=Exception("Execution error"))
         pipeline_server_manager.log = MagicMock()
         result, error = pipeline_server_manager.execute_request_on_instance("test_name", "1.0", "instance_123", {"key": "value"})
